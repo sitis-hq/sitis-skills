@@ -5,7 +5,7 @@ one skill: `SKILL.md` plus whatever it needs beside it.
 
 YouTube channel operations live in their own repository,
 [`sitis-hq/youtube-skills`](https://github.com/sitis-hq/youtube-skills). This one keeps the skills of
-music releases that are not about YouTube.
+music releases that are not about YouTube, and general content skills such as image prompting.
 
 ## How a run receives a skill
 
@@ -33,3 +33,4 @@ is installed.
 | `music-lyrics-generate` | Create Music Release — "Create text content" |
 | `music-cover-art-create` | Create Music Release — "Create cover images" |
 | `youtube-music-metadata-optimization` | Create Music Release — "Distribute video to YouTube"; to be replaced by `youtube-metadata` from `sitis-hq/youtube-skills` |
+| `photorealistic-image-generation` | not attached yet — building prompts for photorealistic, candid-looking images; the model and the output size stay with the recipe that attaches it |
