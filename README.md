@@ -31,6 +31,4 @@ is installed.
 | Skill | Used by |
 | --- | --- |
 | `music-lyrics-generate` | Create Music Release — "Create text content" |
-| `music-cover-art-create` | Create Music Release — "Create cover images" |
-| `youtube-music-metadata-optimization` | Create Music Release — "Distribute video to YouTube"; to be replaced by `youtube-metadata` from `sitis-hq/youtube-skills` |
-| `photorealistic-image-generation` | not attached yet — building prompts for photorealistic, candid-looking images; the model and the output size stay with the recipe that attaches it |
+| `photorealistic-image-generation` | Create Music Release — "Create cover images", "Create music story shorts" |
