@@ -1,6 +1,6 @@
 ---
 name: music-mix-assemble
-description: Join released songs' videos into one mix video deterministically — video copied without re-encoding, each song's audio normalised to one loudness with a short fade in and out, chapters for the description. Use when a step assembles a mix, compilation or playlist video from the channel's own release videos.
+description: Join released songs into one mix video deterministically — the sound built once from each song's master WAV at one loudness with a short fade in and out, cut to its video's exact length; the picture copied without re-encoding when the videos match, re-encoded once when they do not; chapters for the description. Use when a step assembles a mix, compilation or playlist video from the channel's own release videos.
 ---
 
 # Assemble a mix video
