@@ -27,7 +27,8 @@ python3 <base>/scripts/assemble_mix.py --songs songs.json --out mix.mp4 --trackl
   the songs start at the same instant in sound and picture and nothing adds up over many songs; a
   constant gain brings it to `--lufs`, held 1 dB below true peak (its own dynamics kept, no limiter); it fades in and out inside its length;
   the whole mix is encoded once to AAC from the masters. A master more than 0.1 s off its video's
-  length is refused — it is not that video's master.
+  length, or 20 ms or more off the video's own sound over the first 30 s, is refused — it is not on
+  that video's timeline. Each track reports its `master_offset_ms`.
 - **Picture**: copied without re-encoding when every video shares its parameters (codec, profile,
   level, size, pixel format, frame rate, time base, aspect, colour) — seconds, every frame the
   release's. When they differ (videos from different renderers), `auto` re-encodes the picture once

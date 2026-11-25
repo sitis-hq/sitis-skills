@@ -14,7 +14,8 @@ stream's exact length (so the songs' starts in the sound and in the picture are 
 with nothing adding up over many songs), raised or lowered by a constant gain to --lufs (measured
 with EBU R128; a constant gain keeps each master's own dynamics; held 1 dB below true peak), faded in and out by --fade inside
 its length, joined, and encoded once to AAC. A master more than 0.1 s longer or shorter than its
-video is refused — it is not that video's master.
+video, or sitting 20 ms or more off the video's own sound over the first 30 s, is refused — it is
+not on that video's timeline.
 
 Video — `--video copy` joins the streams without re-encoding (seconds, every frame the release's);
 it needs every video to share codec, profile, level, size, pixel format, frame rate, time base,
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from array import array
 import shutil
 import subprocess
 import sys
@@ -48,6 +50,9 @@ LENGTH_SLACK = 0.1
 # The sound and the picture of the finished mix: two frames at 60 fps.
 SYNC_SLACK = 0.034
 TRUE_PEAK = -1.0
+# The master must sit on its video's own sound: compared over the first 30 s in 10 ms blocks,
+# searched ±0.5 s; two blocks or more (≥ 20 ms, over a frame at 60 fps) is another timeline.
+ALIGN_SECONDS, ALIGN_BLOCK, ALIGN_SEARCH, ALIGN_MAX_BLOCKS = 30, 0.01, 0.5, 1
 FRAME = (1920, 1080, "60")
 
 
@@ -97,6 +102,37 @@ def loudness(path: Path) -> tuple[float, float]:
     if not i or not tp:
         raise Refusal(f"the loudness of {path} could not be measured")
     return float(i[-1][1]), float(tp[-1][1])
+
+
+def _onsets(path: Path, stream: str) -> list[float]:
+    """Rises of loudness per 10 ms block over the first ALIGN_SECONDS, mono 8 kHz."""
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-map", stream, "-t", str(ALIGN_SECONDS),
+                        "-ac", "1", "-ar", "8000", "-f", "s16le", "-"], capture_output=True, check=False)
+    pcm = array("h")
+    pcm.frombytes(r.stdout[: len(r.stdout) // 2 * 2])
+    n = int(8000 * ALIGN_BLOCK)
+    env = [sum(abs(x) for x in pcm[i:i + n]) / n for i in range(0, len(pcm) - n + 1, n)]
+    return [max(0.0, b - a) for a, b in zip(env, env[1:])]
+
+
+def master_offset(master: Path, video: Path) -> float:
+    """Seconds by which the master is late (+) or early (−) against the video's own sound."""
+    m, v = _onsets(master, "0:a:0"), _onsets(video, "0:a:0")
+    if not v:
+        raise Refusal(f"{video.name} has no sound to check its master against")
+    if not any(m) or not any(v):
+        raise Refusal(f"{master.name} or {video.name} is silent at the start: the alignment cannot be checked")
+    reach = int(ALIGN_SEARCH / ALIGN_BLOCK)
+    best_lag, best = 0, float("-inf")
+    for lag in range(-reach, reach + 1):
+        total = 0.0
+        for i, x in enumerate(m):
+            j = i - lag
+            if 0 <= j < len(v):
+                total += x * v[j]
+        if total > best:
+            best_lag, best = lag, total
+    return best_lag * ALIGN_BLOCK
 
 
 def stamp(seconds: float) -> str:
@@ -189,10 +225,14 @@ def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, b
         if abs(al - pv["duration"]) > LENGTH_SLACK:
             raise Refusal(f"{a.name} is {al:.2f}s but its video {v.name} is {pv['duration']:.2f}s — "
                           "not that video's master")
+        offset = master_offset(a, v)
+        if round(abs(offset) / ALIGN_BLOCK) > ALIGN_MAX_BLOCKS:
+            raise Refusal(f"{a.name} sits {offset * 1000:+.0f} ms off its video {v.name}'s own sound — "
+                          "not on that video's timeline")
         if pv["duration"] <= 2 * fade:
             raise Refusal(f"{v.name} is {pv['duration']:.1f}s, too short for two {fade}s fades")
         prepared.append({"title": s["title"], "video_path": v, "audio_path": a, "probe": pv,
-                         "video_duration": pv["duration"], "measured_lufs": i, "true_peak": tp,
+                         "video_duration": pv["duration"], "master_offset": offset, "measured_lufs": i, "true_peak": tp,
                          # A constant gain to the target, held below the true-peak ceiling so a quiet
                          # master is not pushed into clipping; no limiter, so its dynamics stay.
                          "gain_db": min(lufs - i, TRUE_PEAK - tp)})
@@ -214,7 +254,8 @@ def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, b
     for s in prepared:
         tracks.append({"title": s["title"], "video": str(s["video_path"]), "audio": str(s["audio_path"]),
                        "start": round(start, 3), "duration": round(s["video_duration"], 3),
-                       "measured_lufs": s["measured_lufs"], "gain_db": round(s["gain_db"], 2)})
+                       "measured_lufs": s["measured_lufs"], "gain_db": round(s["gain_db"], 2),
+                       "master_offset_ms": round(s["master_offset"] * 1000)})
         start += s["video_duration"]
     return {"ok": True, "out": str(out), "duration": round(got_v, 3), "video_mode": used,
             "video_mismatch": diff, "lufs": lufs, "fade": fade, "tracks": tracks,

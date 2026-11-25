@@ -16,16 +16,17 @@ HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
 def make(d: Path, name: str, seconds: float, fps: int = 30, freq: int = 440, wav_seconds: float | None = None,
-         audio_extra: float = 0.0):
+         audio_extra: float = 0.0, wav_delay_ms: int = 0):
     video, wav = d / f"{name}.mp4", d / f"{name}.wav"
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", f"testsrc=size=320x180:rate={fps}:duration={seconds}",
-                    "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={seconds + audio_extra}:sample_rate=48000",
+                    "-f", "lavfi", "-i", f"sine=frequency={freq}:beep_factor=4:duration={seconds + audio_extra}:sample_rate=48000",
                     "-ac", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
                     *([] if audio_extra else ["-shortest"]),
                     str(video)], check=True)
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={wav_seconds or seconds}:sample_rate=48000",
+                    "-f", "lavfi", "-i", f"sine=frequency={freq}:beep_factor=4:duration={wav_seconds or seconds}:sample_rate=48000",
+                    "-af", f"adelay={wav_delay_ms}:all=1,atrim=0:{wav_seconds or seconds}" if wav_delay_ms else "anull",
                     "-ac", "2", "-c:a", "pcm_s24le", str(wav)], check=True)
     return {"video": str(video), "audio": str(wav), "title": name}
 
@@ -71,6 +72,17 @@ class Assemble(unittest.TestCase):
         with self.assertRaises(am.Refusal) as e:
             am.assemble(songs, self.d / "mix.mp4", -14, 1.0, "128k", "auto")
         self.assertIn("B.wav", str(e.exception))
+
+    def test_a_master_off_its_videos_sound_is_refused(self):
+        songs = [make(self.d, "A", 4), make(self.d, "B", 4, freq=550, wav_delay_ms=200)]
+        with self.assertRaises(am.Refusal) as e:
+            am.assemble(songs, self.d / "mix.mp4", -14, 1.0, "128k", "auto")
+        self.assertIn("ms off", str(e.exception))
+
+    def test_a_master_on_its_videos_sound_reports_no_offset(self):
+        r = am.assemble([make(self.d, "A", 4), make(self.d, "B", 4, freq=550)], self.d / "mix.mp4", -14, 1.0,
+                        "128k", "auto")
+        self.assertEqual([t["master_offset_ms"] for t in r["tracks"]], [0, 0])
 
     def test_the_command_line_writes_the_tracklist(self):
         spec = self.d / "songs.json"
