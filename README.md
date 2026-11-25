@@ -32,3 +32,4 @@ is installed.
 | --- | --- |
 | `music-lyrics-generate` | Create Music Release — "Create text content" |
 | `photorealistic-image-generation` | Create Music Release — "Create cover images", "Create music story shorts" |
+| `music-mix-assemble` | Create Music Mix — the assembly step (planned) |
