@@ -11,24 +11,27 @@ One script does the assembly, so every mix is made the same way:
 python3 <base>/scripts/assemble_mix.py --songs songs.json --out mix.mp4 --tracklist tracklist.json
 ```
 
-- `songs.json` — the songs in play order: `[{"file": "<path to the song's 16:9 video>", "title": "<song title>"}, …]`,
-  at least two.
-- Options: `--lufs -14` (loudness target), `--true-peak -1.5`, `--fade 1.5` (seconds, in and out of
-  each song), `--audio-bitrate 192k`. Keep the defaults unless the step says otherwise.
-- Output (stdout and `--tracklist`): `duration`, `tracks` (title, start, duration, measured loudness)
-  and `chapters` — lines such as `0:00 Song A` for the description, in order.
+- `songs.json` — the songs in play order, at least two:
+  `[{"video": "<the song's 16:9 video>", "audio": "<the song's master WAV>", "title": "<song title>"}, …]`.
+  The master is the WAV the release's video was made from (Create Music Release's audio step); it
+  starts where the video's audio starts.
+- Options: `--lufs -14`, `--fade 1.5` (seconds, in and out of each song), `--audio-bitrate 192k`,
+  `--video auto|copy|encode` (default auto). Keep the defaults unless the step says otherwise.
+- Output (stdout and `--tracklist`): `duration`, `video_mode` (copy or encode, and the file that
+  differed when it encoded), `tracks` (title, start, duration, measured loudness) and `chapters` —
+  lines such as `0:00 Song A` for the description, in order.
 
 ## What it does, and what it refuses
 
-- **The picture is copied, not re-encoded**: the mix is assembled in seconds and every frame is the
-  release's. That works only when all videos share their parameters (codec, profile, size, pixel
-  format, frame rate, time base; audio codec, sample rate, channels). The script checks with ffprobe
-  first and **refuses, naming the file that differs** — then the step reports it; it never re-encodes
-  around it. Videos rendered by the same visualizer template match.
-- **Only the audio is processed**: each song is measured and normalised to `--lufs` (two-pass
-  loudnorm), so no song is louder than the next, and fades in and out inside its own length. Audio and
-  video keep the same length and stay in sync; the script checks the mix's length against the sum of
-  its songs and refuses a mismatch over 0.5 s.
-- **Joins of the picture are cuts**; each release's own intro carries the change.
-- A refusal exits 2 with `{"ok": false, "error": "…"}`. Needs `ffmpeg` and `ffprobe` (in the worker
-  image).
+- **Sound, in one pass**: each master is cut or padded with silence to its video's exact length, so
+  the songs start at the same instant in sound and picture and nothing adds up over many songs; a
+  constant gain brings it to `--lufs` (its own dynamics kept); it fades in and out inside its length;
+  the whole mix is encoded once to AAC from the masters. A master more than 0.5 s off its video's
+  length is refused — it is not that video's master.
+- **Picture**: copied without re-encoding when every video shares its parameters (codec, profile,
+  level, size, pixel format, frame rate, time base, aspect, colour) — seconds, every frame the
+  release's. When they differ (videos from different renderers), `auto` re-encodes the picture once
+  (libx264 CRF 18, the first video's size and rate) and says which file differed; `copy` refuses.
+  Joins of the picture are cuts; each release's own intro carries the change.
+- The script checks the mix's lengths against its songs and refuses a mismatch. A refusal exits 2
+  with `{"ok": false, "error": "…"}`. Needs `ffmpeg` and `ffprobe` (in the worker image).

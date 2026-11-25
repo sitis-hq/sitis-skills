@@ -1,22 +1,30 @@
 #!/usr/bin/env python3
-"""Join released songs' videos into one mix video, deterministically.
+"""Join released songs into one mix video, deterministically.
 
   assemble_mix.py --songs songs.json --out mix.mp4 [--tracklist tracklist.json]
-                  [--lufs -14] [--true-peak -1.5] [--fade 1.5] [--audio-bitrate 192k]
+                  [--lufs -14] [--fade 1.5] [--audio-bitrate 192k] [--video auto|copy|encode]
 
-songs.json is a JSON list in play order: [{"file": "…/song-a-16x9.mp4", "title": "Song A"}, …].
+songs.json is a JSON list in play order:
+  [{"video": "…/song-a-16x9.mp4", "audio": "…/song-a-master.wav", "title": "Song A"}, …]
+`audio` is the song's master (the WAV the release's video was made from); it starts where the
+video's own audio starts, so it replaces it sample for sample.
 
-The video stream of every song is copied as it is — no re-encode, so the picture is bit for bit the
-release's and the mix is assembled in seconds. That is only valid when every file has the same video
-and audio parameters (codec, profile, size, pixel format, frame rate, time base, sample rate,
-channels); the script checks them with ffprobe first and refuses, naming the file that differs,
-rather than producing a mix that stutters at a join. Only the audio is re-encoded: each song is
-normalised to --lufs (two-pass loudnorm, linear) so no song is louder than the next, and gets a
---fade fade-in and fade-out inside its own length, so audio and video stay the same length and in
-sync. The joins of the picture are hard cuts; the releases' own intros carry the change.
+Audio — one pass for the whole mix: every master is cut or padded with silence to its video
+stream's exact length (so the songs' starts in the sound and in the picture are the same instant,
+with nothing adding up over many songs), raised or lowered by a constant gain to --lufs (measured
+with EBU R128; a constant gain keeps each master's own dynamics), faded in and out by --fade inside
+its length, joined, and encoded once to AAC. A master more than 0.5 s longer or shorter than its
+video is refused — it is not that video's master.
 
-Prints JSON: the mix's duration, each song's start, and description chapter lines ("0:00 Song A").
-Writes --tracklist with the same data. A refusal exits 2 with {"ok": false, "error": …}.
+Video — `--video copy` joins the streams without re-encoding (seconds, every frame the release's);
+it needs every video to share codec, profile, level, size, pixel format, frame rate, time base,
+sample aspect ratio and colour fields, which ffprobe checks first. `encode` re-encodes all videos
+once to the first video's size and frame rate (libx264, CRF 18). `auto` (default) copies when they
+match and encodes when they do not, saying which file differed. Joins of the picture are cuts; each
+release's own intro carries the change.
+
+Prints JSON: the mix's duration, the video mode used, each song's start, and description chapter
+lines ("0:00 Song A"); writes the same to --tracklist. A refusal exits 2 with {"ok": false, …}.
 Needs ffmpeg and ffprobe on PATH. Standard library only: Python 3.11.
 """
 
@@ -31,9 +39,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-# What must be equal for the concat demuxer to copy the video without a stutter at a join.
-VIDEO_KEYS = ("codec_name", "profile", "width", "height", "pix_fmt", "r_frame_rate", "time_base")
-AUDIO_KEYS = ("codec_name", "sample_rate", "channels")
+# What must be equal for the concat demuxer to copy the picture without a glitch at a join.
+VIDEO_KEYS = ("codec_name", "profile", "level", "width", "height", "pix_fmt", "r_frame_rate", "time_base",
+              "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries",
+              "field_order")
+LENGTH_SLACK = 0.5
 
 
 class Refusal(Exception):
@@ -50,41 +60,36 @@ def need_tools() -> None:
             raise Refusal(f"{tool} is not on PATH")
 
 
-def probe(path: Path) -> dict[str, Any]:
-    r = run(["ffprobe", "-v", "error", "-show_entries",
-             "stream=codec_type," + ",".join(sorted(set(VIDEO_KEYS + AUDIO_KEYS))) + ":format=duration",
-             "-of", "json", str(path)])
+def probe_video(path: Path) -> dict[str, Any]:
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v", "-show_entries",
+             "stream=" + ",".join(VIDEO_KEYS) + ",duration", "-of", "json", str(path)])
     if r.returncode:
         raise Refusal(f"ffprobe cannot read {path}: {r.stderr.strip()[:300]}")
-    doc = json.loads(r.stdout)
-    streams = doc.get("streams", [])
-    video = [s for s in streams if s.get("codec_type") == "video"]
-    audio = [s for s in streams if s.get("codec_type") == "audio"]
-    if len(video) != 1 or len(audio) != 1:
-        raise Refusal(f"{path} must have exactly one video and one audio stream")
-    return {"video": {k: video[0].get(k) for k in VIDEO_KEYS},
-            "audio": {k: audio[0].get(k) for k in AUDIO_KEYS},
-            "duration": float(doc["format"]["duration"])}
+    streams = json.loads(r.stdout).get("streams", [])
+    if len(streams) != 1:
+        raise Refusal(f"{path} must have exactly one video stream")
+    s = streams[0]
+    if not s.get("duration"):
+        raise Refusal(f"{path}: the video stream has no duration")
+    return {"params": {k: s.get(k) for k in VIDEO_KEYS}, "duration": float(s["duration"])}
 
 
-def check_same(probes: list[tuple[Path, dict[str, Any]]]) -> None:
-    first_path, first = probes[0]
-    for path, p in probes[1:]:
-        for kind in ("video", "audio"):
-            diff = {k: (first[kind][k], p[kind][k]) for k in first[kind] if first[kind][k] != p[kind][k]}
-            if diff:
-                raise Refusal(f"{path.name} differs from {first_path.name} in {kind}: {diff}; the video "
-                              "cannot be copied — render it with the same template settings")
-
-
-def measure(path: Path, lufs: float, tp: float) -> dict[str, str]:
-    r = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-vn",
-             "-af", f"loudnorm=I={lufs}:TP={tp}:LRA=11:print_format=json", "-f", "null", "-"])
-    text = r.stderr
+def audio_length(path: Path) -> float:
+    r = run(["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=duration",
+             "-of", "csv=p=0", str(path)])
     try:
-        return json.loads(text[text.rindex("{"):text.rindex("}") + 1])
+        return float(r.stdout.strip())
     except ValueError:
-        raise Refusal(f"loudness of {path} could not be measured: {text[-300:]}") from None
+        raise Refusal(f"{path} has no readable audio stream") from None
+
+
+def loudness(path: Path) -> float:
+    r = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+             "-af", "ebur128=framelog=quiet", "-f", "null", "-"])
+    lines = [ln.split() for ln in r.stderr.splitlines() if ln.strip().startswith("I:")]
+    if not lines:
+        raise Refusal(f"the loudness of {path} could not be measured")
+    return float(lines[-1][1])
 
 
 def stamp(seconds: float) -> str:
@@ -94,65 +99,123 @@ def stamp(seconds: float) -> str:
     return f"{h}:{m:02d}:{sec:02d}" if h else f"{m}:{sec:02d}"
 
 
-def assemble(songs: list[dict[str, str]], out: Path, lufs: float, tp: float, fade: float,
-             bitrate: str) -> dict[str, Any]:
+def first_difference(probes: list[tuple[Path, dict[str, Any]]]) -> str | None:
+    base_path, base = probes[0]
+    for path, p in probes[1:]:
+        diff = {k: (base["params"][k], p["params"][k]) for k in VIDEO_KEYS if base["params"][k] != p["params"][k]}
+        if diff:
+            return f"{path.name} differs from {base_path.name}: {diff}"
+    return None
+
+
+def build_video(probes: list[tuple[Path, dict[str, Any]]], mode: str, tmp: Path) -> tuple[Path, str, str | None]:
+    out = tmp / "video.mp4"
+    diff = first_difference(probes)
+    if mode == "copy" and diff:
+        raise Refusal(f"--video copy, but {diff}")
+    use = "copy" if mode == "copy" or (mode == "auto" and not diff) else "encode"
+    if use == "copy":
+        listing = tmp / "videos.txt"
+        listing.write_text("".join(f"file '{p.resolve().as_posix()}'\n" for p, _ in probes), encoding="utf-8")
+        r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
+                 "-i", str(listing), "-map", "0:v", "-c", "copy", str(out)])
+    else:
+        w, h = probes[0][1]["params"]["width"], probes[0][1]["params"]["height"]
+        fps = probes[0][1]["params"]["r_frame_rate"]
+        inputs: list[str] = []
+        chains = []
+        for i, (p, pr) in enumerate(probes):
+            inputs += ["-i", str(p)]
+            # Each video normalised to the first one's frame, then trimmed to its own length so the
+            # audio cut to the same lengths stays in step.
+            chains.append(f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:"
+                          f"(oh-ih)/2,setsar=1,fps={fps},format=yuv420p,trim=0:{pr['duration']:.6f},"
+                          f"setpts=PTS-STARTPTS[v{i}]")
+        graph = ";".join(chains) + ";" + "".join(f"[v{i}]" for i in range(len(probes))) + \
+            f"concat=n={len(probes)}:v=1:a=0[vout]"
+        r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs, "-filter_complex", graph,
+                 "-map", "[vout]", "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p",
+                 str(out)])
+    if r.returncode:
+        raise Refusal(f"building the picture failed: {r.stderr.strip()[-400:]}")
+    return out, use, diff
+
+
+def build_audio(songs: list[dict[str, Any]], lufs: float, fade: float, bitrate: str, tmp: Path) -> Path:
+    out = tmp / "audio.m4a"
+    inputs: list[str] = []
+    chains = []
+    for i, s in enumerate(songs):
+        inputs += ["-i", str(s["audio_path"])]
+        d = s["video_duration"]
+        chains.append(f"[{i}:a]aresample=48000,atrim=0:{d:.6f},apad=whole_dur={d:.6f},asetpts=N/SR/TB,"
+                      f"volume={lufs - s['measured_lufs']:.2f}dB,afade=t=in:st=0:d={fade},"
+                      f"afade=t=out:st={max(d - fade, 0):.6f}:d={fade}[a{i}]")
+    graph = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(songs))) + \
+        f"concat=n={len(songs)}:v=0:a=1[aout]"
+    r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *inputs, "-filter_complex", graph,
+             "-map", "[aout]", "-c:a", "aac", "-b:a", bitrate, "-ar", "48000", str(out)])
+    if r.returncode:
+        raise Refusal(f"building the sound failed: {r.stderr.strip()[-400:]}")
+    return out
+
+
+def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, bitrate: str,
+             video_mode: str) -> dict[str, Any]:
     if len(songs) < 2:
         raise Refusal("a mix needs at least two songs")
-    paths = []
+    prepared = []
     for s in songs:
-        if not isinstance(s, dict) or not s.get("file") or not s.get("title"):
-            raise Refusal("each song is {\"file\": …, \"title\": …}")
-        p = Path(s["file"])
-        if not p.is_file():
-            raise Refusal(f"no such file: {p}")
-        paths.append(p)
-    probes = [(p, probe(p)) for p in paths]
-    check_same(probes)
-    sample_rate = probes[0][1]["audio"]["sample_rate"]
-    with tempfile.TemporaryDirectory(dir=out.parent) as tmp:
-        parts, tracks, start = [], [], 0.0
-        for i, ((path, pr), song) in enumerate(zip(probes, songs)):
-            if pr["duration"] <= 2 * fade:
-                raise Refusal(f"{path.name} is {pr['duration']:.1f}s, too short for two {fade}s fades")
-            m = measure(path, lufs, tp)
-            af = (f"loudnorm=I={lufs}:TP={tp}:LRA=11:measured_I={m['input_i']}:measured_TP={m['input_tp']}:"
-                  f"measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}:"
-                  f"offset={m['target_offset']}:linear=true,aresample={sample_rate},"
-                  f"afade=t=in:st=0:d={fade},afade=t=out:st={pr['duration'] - fade:.3f}:d={fade}")
-            part = Path(tmp) / f"part{i:03d}.mp4"
-            r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-map", "0:v",
-                     "-map", "0:a", "-c:v", "copy", "-af", af, "-c:a", "aac", "-b:a", bitrate,
-                     "-ar", str(sample_rate), str(part)])
-            if r.returncode:
-                raise Refusal(f"processing {path.name} failed: {r.stderr.strip()[:300]}")
-            length = probe(part)["duration"]
-            tracks.append({"title": song["title"], "file": str(path), "start": round(start, 3),
-                           "duration": round(length, 3), "measured_lufs": float(m["input_i"])})
-            start += length
-            parts.append(part)
-        listing = Path(tmp) / "list.txt"
-        listing.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
-        r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
-                 "-i", str(listing), "-c", "copy", "-movflags", "+faststart", str(out)])
+        if not isinstance(s, dict) or not s.get("video") or not s.get("audio") or not s.get("title"):
+            raise Refusal('each song is {"video": …, "audio": …, "title": …}')
+        v, a = Path(s["video"]), Path(s["audio"])
+        for f in (v, a):
+            if not f.is_file():
+                raise Refusal(f"no such file: {f}")
+        pv = probe_video(v)
+        al = audio_length(a)
+        if abs(al - pv["duration"]) > LENGTH_SLACK:
+            raise Refusal(f"{a.name} is {al:.2f}s but its video {v.name} is {pv['duration']:.2f}s — "
+                          "not that video's master")
+        if pv["duration"] <= 2 * fade:
+            raise Refusal(f"{v.name} is {pv['duration']:.1f}s, too short for two {fade}s fades")
+        prepared.append({"title": s["title"], "video_path": v, "audio_path": a, "probe": pv,
+                         "video_duration": pv["duration"], "measured_lufs": loudness(a)})
+    with tempfile.TemporaryDirectory(dir=out.parent) as tmpdir:
+        tmp = Path(tmpdir)
+        video, used, diff = build_video([(s["video_path"], s["probe"]) for s in prepared], video_mode, tmp)
+        audio = build_audio(prepared, lufs, fade, bitrate, tmp)
+        r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video), "-i", str(audio),
+                 "-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart", str(out)])
         if r.returncode:
-            raise Refusal(f"joining failed: {r.stderr.strip()[:300]}")
-    total = probe(out)["duration"]
-    if abs(total - start) > 0.5:
-        raise Refusal(f"the mix is {total:.2f}s but its songs add up to {start:.2f}s — not written as valid")
-    chapters = [f"{stamp(t['start'])} {t['title']}" for t in tracks]
-    return {"ok": True, "out": str(out), "duration": round(total, 3), "lufs": lufs, "fade": fade,
-            "tracks": tracks, "chapters": chapters}
+            raise Refusal(f"muxing failed: {r.stderr.strip()[-300:]}")
+    expected = sum(s["video_duration"] for s in prepared)
+    got_v = probe_video(out)["duration"]
+    got_a = audio_length(out)
+    if abs(got_v - expected) > LENGTH_SLACK or abs(got_a - got_v) > 0.1:
+        out.unlink(missing_ok=True)
+        raise Refusal(f"the mix came out {got_v:.2f}s video / {got_a:.2f}s audio, expected {expected:.2f}s")
+    tracks, start = [], 0.0
+    for s in prepared:
+        tracks.append({"title": s["title"], "video": str(s["video_path"]), "audio": str(s["audio_path"]),
+                       "start": round(start, 3), "duration": round(s["video_duration"], 3),
+                       "measured_lufs": s["measured_lufs"]})
+        start += s["video_duration"]
+    return {"ok": True, "out": str(out), "duration": round(got_v, 3), "video_mode": used,
+            "video_mismatch": diff, "lufs": lufs, "fade": fade, "tracks": tracks,
+            "chapters": [f"{stamp(t['start'])} {t['title']}" for t in tracks]}
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="assemble_mix.py", description=__doc__.split("\n\n")[0])
-    p.add_argument("--songs", required=True, help="JSON list in play order: [{file, title}, …]")
+    p.add_argument("--songs", required=True, help='JSON list in play order: [{"video", "audio", "title"}, …]')
     p.add_argument("--out", required=True, help="the mix video to write (.mp4)")
     p.add_argument("--tracklist", help="also write the tracks and chapters here (JSON)")
-    p.add_argument("--lufs", type=float, default=-14.0, help="integrated loudness target (default -14)")
-    p.add_argument("--true-peak", type=float, default=-1.5, help="true peak ceiling (default -1.5 dBTP)")
+    p.add_argument("--lufs", type=float, default=-14.0, help="integrated loudness of every song (default -14)")
     p.add_argument("--fade", type=float, default=1.5, help="fade in and out of each song, seconds (1.5)")
     p.add_argument("--audio-bitrate", default="192k", help="AAC bitrate (default 192k)")
+    p.add_argument("--video", choices=["auto", "copy", "encode"], default="auto",
+                   help="copy the picture, re-encode it once, or copy when the videos match (default)")
     a = p.parse_args(argv)
     try:
         need_tools()
@@ -162,11 +225,11 @@ def main(argv: list[str] | None = None) -> int:
             raise Refusal(f"cannot read {a.songs}: {e}") from None
         if not isinstance(songs, list):
             raise Refusal("--songs must hold a JSON list")
-        if a.fade < 0 or a.fade > 10:
+        if not 0 <= a.fade <= 10:
             raise Refusal("--fade must be between 0 and 10 seconds")
         out = Path(a.out)
         out.parent.mkdir(parents=True, exist_ok=True)
-        result = assemble(songs, out, a.lufs, a.true_peak, a.fade, a.audio_bitrate)
+        result = assemble(songs, out, a.lufs, a.fade, a.audio_bitrate, a.video)
         if a.tracklist:
             Path(a.tracklist).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     except Refusal as e:
