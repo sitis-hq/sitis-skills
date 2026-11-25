@@ -12,14 +12,14 @@ video's own audio starts, so it replaces it sample for sample.
 Audio — one pass for the whole mix: every master is cut or padded with silence to its video
 stream's exact length (so the songs' starts in the sound and in the picture are the same instant,
 with nothing adding up over many songs), raised or lowered by a constant gain to --lufs (measured
-with EBU R128; a constant gain keeps each master's own dynamics), faded in and out by --fade inside
-its length, joined, and encoded once to AAC. A master more than 0.5 s longer or shorter than its
+with EBU R128; a constant gain keeps each master's own dynamics; held 1 dB below true peak), faded in and out by --fade inside
+its length, joined, and encoded once to AAC. A master more than 0.1 s longer or shorter than its
 video is refused — it is not that video's master.
 
 Video — `--video copy` joins the streams without re-encoding (seconds, every frame the release's);
 it needs every video to share codec, profile, level, size, pixel format, frame rate, time base,
 sample aspect ratio and colour fields, which ffprobe checks first. `encode` re-encodes all videos
-once to the first video's size and frame rate (libx264, CRF 18). `auto` (default) copies when they
+once to 1920×1080 at 60 fps (libx264, CRF 18). `auto` (default) copies when they
 match and encodes when they do not, saying which file differed. Joins of the picture are cuts; each
 release's own intro carries the change.
 
@@ -43,7 +43,12 @@ from typing import Any
 VIDEO_KEYS = ("codec_name", "profile", "level", "width", "height", "pix_fmt", "r_frame_rate", "time_base",
               "sample_aspect_ratio", "color_range", "color_space", "color_transfer", "color_primaries",
               "field_order")
-LENGTH_SLACK = 0.5
+# A master is rendered to its video's timeline; renderers round the picture up to a whole frame.
+LENGTH_SLACK = 0.1
+# The sound and the picture of the finished mix: two frames at 60 fps.
+SYNC_SLACK = 0.034
+TRUE_PEAK = -1.0
+FRAME = (1920, 1080, "60")
 
 
 class Refusal(Exception):
@@ -83,13 +88,15 @@ def audio_length(path: Path) -> float:
         raise Refusal(f"{path} has no readable audio stream") from None
 
 
-def loudness(path: Path) -> float:
+def loudness(path: Path) -> tuple[float, float]:
+    """Integrated loudness (LUFS) and true peak (dBTP)."""
     r = run(["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
-             "-af", "ebur128=framelog=quiet", "-f", "null", "-"])
-    lines = [ln.split() for ln in r.stderr.splitlines() if ln.strip().startswith("I:")]
-    if not lines:
+             "-af", "ebur128=peak=true:framelog=quiet", "-f", "null", "-"])
+    i = [ln.split() for ln in r.stderr.splitlines() if ln.strip().startswith("I:")]
+    tp = [ln.split() for ln in r.stderr.splitlines() if ln.strip().startswith("Peak:")]
+    if not i or not tp:
         raise Refusal(f"the loudness of {path} could not be measured")
-    return float(lines[-1][1])
+    return float(i[-1][1]), float(tp[-1][1])
 
 
 def stamp(seconds: float) -> str:
@@ -116,12 +123,16 @@ def build_video(probes: list[tuple[Path, dict[str, Any]]], mode: str, tmp: Path)
     use = "copy" if mode == "copy" or (mode == "auto" and not diff) else "encode"
     if use == "copy":
         listing = tmp / "videos.txt"
-        listing.write_text("".join(f"file '{p.resolve().as_posix()}'\n" for p, _ in probes), encoding="utf-8")
+        # Without `duration` the demuxer steps by each file's container length — the longer of its
+        # audio and video — and every join opens a gap in the picture against the sound.
+        listing.write_text("".join(f"file '{p.resolve().as_posix()}'\nduration {pr['duration']:.6f}\n"
+                                   for p, pr in probes), encoding="utf-8")
         r = run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "concat", "-safe", "0",
                  "-i", str(listing), "-map", "0:v", "-c", "copy", str(out)])
     else:
-        w, h = probes[0][1]["params"]["width"], probes[0][1]["params"]["height"]
-        fps = probes[0][1]["params"]["r_frame_rate"]
+        # One fixed frame, not the first song's: an old 30 fps song opening the mix would otherwise
+        # set the whole mix to 30 fps.
+        w, h, fps = FRAME
         inputs: list[str] = []
         chains = []
         for i, (p, pr) in enumerate(probes):
@@ -149,7 +160,7 @@ def build_audio(songs: list[dict[str, Any]], lufs: float, fade: float, bitrate: 
         inputs += ["-i", str(s["audio_path"])]
         d = s["video_duration"]
         chains.append(f"[{i}:a]aresample=48000,atrim=0:{d:.6f},apad=whole_dur={d:.6f},asetpts=N/SR/TB,"
-                      f"volume={lufs - s['measured_lufs']:.2f}dB,afade=t=in:st=0:d={fade},"
+                      f"volume={s['gain_db']:.2f}dB,afade=t=in:st=0:d={fade},"
                       f"afade=t=out:st={max(d - fade, 0):.6f}:d={fade}[a{i}]")
     graph = ";".join(chains) + ";" + "".join(f"[a{i}]" for i in range(len(songs))) + \
         f"concat=n={len(songs)}:v=0:a=1[aout]"
@@ -173,6 +184,7 @@ def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, b
             if not f.is_file():
                 raise Refusal(f"no such file: {f}")
         pv = probe_video(v)
+        i, tp = loudness(a)
         al = audio_length(a)
         if abs(al - pv["duration"]) > LENGTH_SLACK:
             raise Refusal(f"{a.name} is {al:.2f}s but its video {v.name} is {pv['duration']:.2f}s — "
@@ -180,7 +192,10 @@ def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, b
         if pv["duration"] <= 2 * fade:
             raise Refusal(f"{v.name} is {pv['duration']:.1f}s, too short for two {fade}s fades")
         prepared.append({"title": s["title"], "video_path": v, "audio_path": a, "probe": pv,
-                         "video_duration": pv["duration"], "measured_lufs": loudness(a)})
+                         "video_duration": pv["duration"], "measured_lufs": i, "true_peak": tp,
+                         # A constant gain to the target, held below the true-peak ceiling so a quiet
+                         # master is not pushed into clipping; no limiter, so its dynamics stay.
+                         "gain_db": min(lufs - i, TRUE_PEAK - tp)})
     with tempfile.TemporaryDirectory(dir=out.parent) as tmpdir:
         tmp = Path(tmpdir)
         video, used, diff = build_video([(s["video_path"], s["probe"]) for s in prepared], video_mode, tmp)
@@ -192,14 +207,14 @@ def assemble(songs: list[dict[str, str]], out: Path, lufs: float, fade: float, b
     expected = sum(s["video_duration"] for s in prepared)
     got_v = probe_video(out)["duration"]
     got_a = audio_length(out)
-    if abs(got_v - expected) > LENGTH_SLACK or abs(got_a - got_v) > 0.1:
+    if abs(got_v - expected) > LENGTH_SLACK or abs(got_a - got_v) > SYNC_SLACK:
         out.unlink(missing_ok=True)
         raise Refusal(f"the mix came out {got_v:.2f}s video / {got_a:.2f}s audio, expected {expected:.2f}s")
     tracks, start = [], 0.0
     for s in prepared:
         tracks.append({"title": s["title"], "video": str(s["video_path"]), "audio": str(s["audio_path"]),
                        "start": round(start, 3), "duration": round(s["video_duration"], 3),
-                       "measured_lufs": s["measured_lufs"]})
+                       "measured_lufs": s["measured_lufs"], "gain_db": round(s["gain_db"], 2)})
         start += s["video_duration"]
     return {"ok": True, "out": str(out), "duration": round(got_v, 3), "video_mode": used,
             "video_mismatch": diff, "lufs": lufs, "fade": fade, "tracks": tracks,

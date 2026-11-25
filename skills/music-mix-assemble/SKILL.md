@@ -25,13 +25,13 @@ python3 <base>/scripts/assemble_mix.py --songs songs.json --out mix.mp4 --trackl
 
 - **Sound, in one pass**: each master is cut or padded with silence to its video's exact length, so
   the songs start at the same instant in sound and picture and nothing adds up over many songs; a
-  constant gain brings it to `--lufs` (its own dynamics kept); it fades in and out inside its length;
-  the whole mix is encoded once to AAC from the masters. A master more than 0.5 s off its video's
+  constant gain brings it to `--lufs`, held 1 dB below true peak (its own dynamics kept, no limiter); it fades in and out inside its length;
+  the whole mix is encoded once to AAC from the masters. A master more than 0.1 s off its video's
   length is refused — it is not that video's master.
 - **Picture**: copied without re-encoding when every video shares its parameters (codec, profile,
   level, size, pixel format, frame rate, time base, aspect, colour) — seconds, every frame the
   release's. When they differ (videos from different renderers), `auto` re-encodes the picture once
-  (libx264 CRF 18, the first video's size and rate) and says which file differed; `copy` refuses.
+  (libx264 CRF 18, 1920×1080 at 60 fps) and says which file differed; `copy` refuses.
   Joins of the picture are cuts; each release's own intro carries the change.
-- The script checks the mix's lengths against its songs and refuses a mismatch. A refusal exits 2
+- The script checks the mix's length against its songs, and its sound against its picture to two frames, and refuses a mismatch. A refusal exits 2
   with `{"ok": false, "error": "…"}`. Needs `ffmpeg` and `ffprobe` (in the worker image).

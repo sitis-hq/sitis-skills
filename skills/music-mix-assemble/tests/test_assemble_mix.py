@@ -15,12 +15,14 @@ import assemble_mix as am  # noqa: E402
 HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
 
 
-def make(d: Path, name: str, seconds: float, fps: int = 30, freq: int = 440, wav_seconds: float | None = None):
+def make(d: Path, name: str, seconds: float, fps: int = 30, freq: int = 440, wav_seconds: float | None = None,
+         audio_extra: float = 0.0):
     video, wav = d / f"{name}.mp4", d / f"{name}.wav"
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", f"testsrc=size=320x180:rate={fps}:duration={seconds}",
-                    "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={seconds}:sample_rate=48000",
-                    "-ac", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+                    "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={seconds + audio_extra}:sample_rate=48000",
+                    "-ac", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                    *([] if audio_extra else ["-shortest"]),
                     str(video)], check=True)
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
                     "-f", "lavfi", "-i", f"sine=frequency={freq}:duration={wav_seconds or seconds}:sample_rate=48000",
@@ -45,12 +47,19 @@ class Assemble(unittest.TestCase):
         self.assertAlmostEqual(r["tracks"][1]["start"], r["tracks"][0]["duration"], places=3)
         self.assertLess(abs(am.audio_length(self.d / "mix.mp4") - r["duration"]), 0.1)
 
+    def test_joins_do_not_drift_when_a_video_carries_longer_audio(self):
+        # The container is as long as its audio; the picture must still step by the video's length.
+        songs = [make(self.d, n, 4, freq=f, audio_extra=0.25) for n, f in (("A", 440), ("B", 550), ("C", 660))]
+        r = am.assemble(songs, self.d / "mix.mp4", -14, 0.5, "128k", "copy")
+        self.assertLess(abs(am.probe_video(self.d / "mix.mp4")["duration"] - 12.0), am.SYNC_SLACK)
+        self.assertLess(abs(am.audio_length(self.d / "mix.mp4") - r["duration"]), am.SYNC_SLACK)
+
     def test_videos_that_differ_are_encoded_once_in_auto(self):
         songs = [make(self.d, "A", 4), make(self.d, "B", 4, fps=25, freq=550)]
         r = am.assemble(songs, self.d / "mix.mp4", -14, 1.0, "128k", "auto")
         self.assertEqual(r["video_mode"], "encode")
         self.assertIn("B.mp4", r["video_mismatch"])
-        self.assertEqual(am.probe_video(self.d / "mix.mp4")["params"]["r_frame_rate"], "30/1")
+        self.assertEqual(am.probe_video(self.d / "mix.mp4")["params"]["r_frame_rate"], "60/1")
 
     def test_copy_refuses_videos_that_differ(self):
         songs = [make(self.d, "A", 4), make(self.d, "B", 4, fps=25, freq=550)]
