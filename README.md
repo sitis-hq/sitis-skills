@@ -32,5 +32,5 @@ is installed.
 | --- | --- |
 | `music-lyrics-generate` | Create Music Release — "Create text content" |
 | `photorealistic-image-generation` | Create Music Release — "Create cover images", "Create music story shorts" |
-| `spotify-pitch` | Create Music Release — "Distribute single to DistroKid"; Pitch a Song on Spotify |
+| `spotify-pitch` | Create Music Release — "Distribute single to DistroKid" |
 | `music-mix-assemble` | Create Music Mix — the assembly step (planned) |

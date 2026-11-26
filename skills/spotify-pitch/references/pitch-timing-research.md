@@ -1,5 +1,9 @@
 # When to pitch a track in Spotify for Artists: what artists' real experience shows (as of October 2026)
 
+> **Background, not used for planning.** The timings below are artists' reports; the recipes never
+> plan by them. Only Spotify's rules (one pitch at a time, a released song cannot be pitched, the
+> 500-character description) are used, as stated in `../SKILL.md`.
+
 Short answer: pitch on the same day the track appears in the Upcoming tab. To make that possible, hand the release to your distributor 4–6 weeks before it comes out, and if your profile is new and not yet confirmed, 6–7 weeks before. Space singles at least 4 weeks apart so each one gets its own pitch window. The artists' stories I found all point the same way: the real bottleneck is not "how many weeks editors like", but the chain "distributor → the track appearing in Spotify for Artists → the pitch". It eats 1–3 weeks, and that is where people fail.
 
 ## TL;DR
